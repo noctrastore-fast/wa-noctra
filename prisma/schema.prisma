@@ -1,0 +1,446 @@
+// ============================================================================
+// NOCTRA STORE — DATABASE SCHEMA
+// ============================================================================
+// Notes:
+// - PostgreSQL chosen (see README "Technology Selection" for rationale).
+// - OrderItem stores price SNAPSHOTS (unitPrice, unitDiscount) — changing a
+//   Product's price later must never alter historical order totals.
+// - DigitalCode has a unique constraint + status machine to guarantee a code
+//   is never handed to two customers (see business rule #8).
+// - WebhookEvent stores a hash of (provider + externalId) to give webhook
+//   processing idempotency (see business rule #7).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum AdminRole {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+enum ProductType {
+  DIGITAL
+  GAME
+  TOPUP
+  REDEEM_CODE
+  SERVICE
+  OTHER
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+  OUT_OF_STOCK
+  HIDDEN
+}
+
+enum FulfillmentType {
+  AUTOMATIC
+  MANUAL
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  PROCESSING
+  COMPLETED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  QRIS
+  EWALLET
+  BANK_TRANSFER
+  VIRTUAL_ACCOUNT
+  GATEWAY
+  MANUAL
+}
+
+enum DiscountType {
+  FIXED
+  PERCENTAGE
+}
+
+enum VoucherStatus {
+  ACTIVE
+  INACTIVE
+  EXPIRED
+}
+
+enum DigitalCodeStatus {
+  AVAILABLE
+  RESERVED
+  SOLD
+  REVOKED
+}
+
+enum NotificationChannel {
+  CUSTOMER
+  ADMIN
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// USER / ADMIN
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(uuid())
+  waNumber      String    @unique // WhatsApp number in E.164, e.g. 6281234567890
+  name          String?
+  username      String?
+  totalOrders   Int       @default(0)
+  totalSpent    Decimal   @default(0) @db.Decimal(14, 2)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lastActivity  DateTime  @default(now())
+
+  carts         Cart[]
+  orders        Order[]
+  voucherUsages VoucherUsage[]
+  notifications Notification[]
+
+  @@index([waNumber])
+}
+
+model Admin {
+  id        String    @id @default(uuid())
+  waNumber  String    @unique
+  name      String?
+  role      AdminRole @default(STAFF)
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  auditLogs AuditLog[]
+
+  @@index([waNumber])
+}
+
+// ---------------------------------------------------------------------------
+// CATALOG
+// ---------------------------------------------------------------------------
+
+model Category {
+  id        String    @id @default(uuid())
+  name      String
+  slug      String    @unique
+  emoji     String?
+  isActive  Boolean   @default(true)
+  sortOrder Int       @default(0)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  products  Product[]
+
+  @@index([slug])
+}
+
+model Product {
+  id                String          @id @default(uuid())
+  sku               String          @unique
+  name              String
+  slug              String          @unique
+  description       String
+  shortDescription  String?
+  price             Decimal         @db.Decimal(14, 2)
+  discountPrice     Decimal?        @db.Decimal(14, 2)
+  categoryId        String
+  category          Category        @relation(fields: [categoryId], references: [id])
+  image             String?
+  stock             Int             @default(0)
+  productType       ProductType     @default(OTHER)
+  fulfillmentType   FulfillmentType @default(MANUAL)
+  status            ProductStatus   @default(ACTIVE)
+  isFeatured        Boolean         @default(false)
+  isPopular         Boolean         @default(false)
+  lowStockThreshold Int             @default(5)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  images            ProductImage[]
+  cartItems         CartItem[]
+  orderItems        OrderItem[]
+  digitalProduct    DigitalProduct?
+
+  @@index([categoryId])
+  @@index([status])
+  @@index([name])
+}
+
+model ProductImage {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// CART
+// ---------------------------------------------------------------------------
+
+model Cart {
+  id        String     @id @default(uuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id])
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  items     CartItem[]
+
+  @@index([userId])
+}
+
+model CartItem {
+  id        String   @id @default(uuid())
+  cartId    String
+  cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cartId, productId])
+  @@index([cartId])
+}
+
+// ---------------------------------------------------------------------------
+// ORDER
+// ---------------------------------------------------------------------------
+
+model Order {
+  id            String        @id @default(uuid())
+  orderNumber   String        @unique // e.g. NS-20260906-0001
+  customerId    String
+  customer      User          @relation(fields: [customerId], references: [id])
+  subtotal      Decimal       @db.Decimal(14, 2)
+  discount      Decimal       @default(0) @db.Decimal(14, 2)
+  fee           Decimal       @default(0) @db.Decimal(14, 2)
+  total         Decimal       @db.Decimal(14, 2)
+  voucherId     String?
+  voucher       Voucher?      @relation(fields: [voucherId], references: [id])
+  paymentMethod PaymentMethod?
+  paymentStatus PaymentStatus @default(PENDING)
+  orderStatus   OrderStatus   @default(PENDING_PAYMENT)
+  expiresAt     DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  items         OrderItem[]
+  payments      Payment[]
+  voucherUsage  VoucherUsage?
+  notifications Notification[]
+
+  @@index([customerId])
+  @@index([orderStatus])
+  @@index([paymentStatus])
+}
+
+model OrderItem {
+  id            String   @id @default(uuid())
+  orderId       String
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product  @relation(fields: [productId], references: [id])
+  productName   String   // snapshot
+  unitPrice     Decimal  @db.Decimal(14, 2) // snapshot
+  unitDiscount  Decimal  @default(0) @db.Decimal(14, 2) // snapshot
+  quantity      Int
+  lineTotal     Decimal  @db.Decimal(14, 2) // snapshot
+  createdAt     DateTime @default(now())
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// PAYMENT
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id              String        @id @default(uuid())
+  orderId         String
+  order           Order         @relation(fields: [orderId], references: [id])
+  provider        String        // e.g. "manual", "midtrans", "xendit"
+  method          PaymentMethod
+  amount          Decimal       @db.Decimal(14, 2)
+  status          PaymentStatus @default(PENDING)
+  externalRef     String?       // provider's payment/transaction id
+  qrString        String?
+  instructions    String?
+  paidAt          DateTime?
+  expiresAt       DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  transactions    PaymentTransaction[]
+
+  @@index([orderId])
+  @@index([status])
+  @@index([externalRef])
+}
+
+model PaymentTransaction {
+  id         String   @id @default(uuid())
+  paymentId  String
+  payment    Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  provider   String
+  rawPayload Json
+  status     PaymentStatus
+  createdAt  DateTime @default(now())
+
+  @@index([paymentId])
+}
+
+// ---------------------------------------------------------------------------
+// VOUCHER
+// ---------------------------------------------------------------------------
+
+model Voucher {
+  id               String        @id @default(uuid())
+  code             String        @unique
+  discountType     DiscountType
+  discountValue    Decimal       @db.Decimal(14, 2)
+  minimumPurchase  Decimal       @default(0) @db.Decimal(14, 2)
+  maximumDiscount  Decimal?      @db.Decimal(14, 2)
+  usageLimit       Int?
+  usagePerCustomer Int           @default(1)
+  startDate        DateTime
+  expiryDate       DateTime
+  status           VoucherStatus @default(ACTIVE)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  orders           Order[]
+  usages           VoucherUsage[]
+
+  @@index([code])
+}
+
+model VoucherUsage {
+  id        String   @id @default(uuid())
+  voucherId String
+  voucher   Voucher  @relation(fields: [voucherId], references: [id])
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  orderId   String   @unique
+  order     Order    @relation(fields: [orderId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([voucherId, userId])
+}
+
+// ---------------------------------------------------------------------------
+// DIGITAL FULFILLMENT
+// ---------------------------------------------------------------------------
+
+model DigitalProduct {
+  id        String   @id @default(uuid())
+  productId String   @unique
+  product   Product  @relation(fields: [productId], references: [id])
+  createdAt DateTime @default(now())
+
+  codes     DigitalCode[]
+}
+
+model DigitalCode {
+  id               String            @id @default(uuid())
+  digitalProductId String
+  digitalProduct   DigitalProduct    @relation(fields: [digitalProductId], references: [id])
+  code             String            @unique
+  status           DigitalCodeStatus @default(AVAILABLE)
+  reservedForOrderId String?
+  soldToUserId     String?
+  soldAt           DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@index([digitalProductId, status])
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFICATION / WEBHOOK / AUDIT / SETTINGS
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String              @id @default(uuid())
+  channel   NotificationChannel
+  userId    String?
+  user      User?               @relation(fields: [userId], references: [id])
+  orderId   String?
+  order     Order?              @relation(fields: [orderId], references: [id])
+  title     String
+  message   String
+  status    NotificationStatus  @default(PENDING)
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  @@index([userId])
+  @@index([orderId])
+}
+
+model WebhookEvent {
+  id            String   @id @default(uuid())
+  provider      String
+  externalId    String   // idempotency key from provider
+  eventType     String
+  rawPayload    Json
+  processed     Boolean  @default(false)
+  processedAt   DateTime?
+  createdAt     DateTime @default(now())
+
+  @@unique([provider, externalId])
+  @@index([processed])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  adminId    String?
+  admin      Admin?   @relation(fields: [adminId], references: [id])
+  action     String   // e.g. "PRODUCT_CREATE", "ORDER_CANCEL"
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([adminId])
+  @@index([entityType, entityId])
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
